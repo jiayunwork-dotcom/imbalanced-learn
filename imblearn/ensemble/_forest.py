@@ -32,6 +32,7 @@ from ..pipeline import make_pipeline
 from ..under_sampling import RandomUnderSampler
 from ..utils import Substitution
 from ..utils._docstring import _n_jobs_docstring, _random_state_docstring
+from ..utils._group_sampling import _check_groups
 from ..utils._sklearn_compat import _fit_context, sklearn_version, validate_data
 from ..utils._validation import check_sampling_strategy
 from ._common import _random_forest_classifier_parameter_constraints
@@ -53,9 +54,13 @@ def _local_parallel_build_trees(
     n_samples_bootstrap=None,
     forest=None,
     missing_values_in_feature_mask=None,
+    groups=None,
 ):
     # resample before to fit the tree
-    X_resampled, y_resampled = sampler.fit_resample(X, y)
+    if groups is None:
+        X_resampled, y_resampled = sampler.fit_resample(X, y)
+    else:
+        X_resampled, y_resampled = sampler.fit_resample(X, y, groups=groups)
     if sample_weight is not None:
         sample_weight = _safe_indexing(sample_weight, sampler.sample_indices_)
     if _get_n_samples_bootstrap is not None:
@@ -356,12 +361,29 @@ class BalancedRandomForestClassifier(RandomForestClassifier):
 
     oob_score_ : float
         Score of the training dataset obtained using an out-of-bag estimate.
+        In grouped mode, rows that no tree can vote on (their group was
+        selected by every tree, or no group was left out) are skipped; the
+        score is NaN when no row has an out-of-bag vote.
 
     oob_decision_function_ : ndarray of shape (n_samples, n_classes)
         Decision function computed with out-of-bag estimate on the training
         set. If n_estimators is small it might be possible that a data point
         was never left out during the bootstrap. In this case,
-        `oob_decision_function_` might contain NaN.
+        `oob_decision_function_` might contain NaN. In grouped mode, a tree
+        contributes only for rows whose group it never selected; rows with no
+        eligible tree get an all-NaN row.
+
+    oob_counts_ : ndarray of shape (n_samples,)
+        Number of trees with an eligible out-of-bag vote for each row. Only
+        defined when ``groups`` is passed and ``oob_score=True``.
+
+    groups_ : ndarray of shape (n_samples,)
+        Group identifier of each training row. Only defined when ``groups`` is
+        passed to ``fit``.
+
+    n_groups_ : int
+        Number of distinct groups in the training data. Only defined when
+        ``groups`` is passed to ``fit``.
 
     See Also
     --------
@@ -502,8 +524,45 @@ class BalancedRandomForestClassifier(RandomForestClassifier):
 
         return estimator, sampler
 
+    def _validate_grouped_parameters(self):
+        """Check the parameter combinations supported by grouped sampling."""
+        sampling_strategy = self.sampling_strategy
+        if not (isinstance(sampling_strategy, str) and sampling_strategy == "auto"):
+            raise ValueError(
+                "Grouped sampling only supports sampling_strategy='auto'; got "
+                f"{self.sampling_strategy!r}."
+            )
+        if self.replacement:
+            raise ValueError(
+                "Grouped sampling does not support replacement=True."
+            )
+        if self.bootstrap:
+            raise ValueError(
+                "Grouped sampling requires bootstrap=False so that each tree "
+                "is trained on exactly the rows of its selected groups."
+            )
+        if self.max_samples is not None:
+            raise ValueError(
+                "Grouped sampling requires max_samples=None."
+            )
+        if self.warm_start:
+            raise ValueError(
+                "Grouped sampling requires warm_start=False."
+            )
+
+    def _clear_group_attributes(self):
+        """Remove the attributes left by a previous fit in grouped mode."""
+        for attribute in (
+            "groups_",
+            "n_groups_",
+            "_groups_codes_",
+            "oob_counts_",
+        ):
+            if hasattr(self, attribute):
+                delattr(self, attribute)
+
     @_fit_context(prefer_skip_nested_validation=True)
-    def fit(self, X, y, sample_weight=None):
+    def fit(self, X, y, sample_weight=None, groups=None):
         """Build a forest of trees from the training set (X, y).
 
         Parameters
@@ -524,6 +583,15 @@ class BalancedRandomForestClassifier(RandomForestClassifier):
             classification, splits are also ignored if they would result in any
             single class carrying a negative weight in either child node.
 
+        groups : array-like of shape (n_samples,), default=None
+            Integer or non-empty string identifier of the group of each row.
+            When provided, whole groups are selected for each tree instead of
+            individual rows, and the out-of-bag estimates only use rows whose
+            group was never selected by the tree. Grouped mode requires
+            ``sampling_strategy='auto'``, ``replacement=False``,
+            ``bootstrap=False``, ``max_samples=None`` and ``warm_start=False``.
+            ``None`` keeps the historical behaviour.
+
         Returns
         -------
         self : object
@@ -533,6 +601,11 @@ class BalancedRandomForestClassifier(RandomForestClassifier):
         # Validate or convert input data
         if issparse(y):
             raise ValueError("sparse multilabel-indicator for y is not supported.")
+
+        grouped = groups is not None
+        if grouped:
+            # Reject unsupported configurations before any tree is built.
+            self._validate_grouped_parameters()
 
         X, y = validate_data(
             self,
@@ -589,6 +662,21 @@ class BalancedRandomForestClassifier(RandomForestClassifier):
         if getattr(y, "dtype", None) != DOUBLE or not y.flags.contiguous:
             y_encoded = np.ascontiguousarray(y_encoded, dtype=DOUBLE)
 
+        if grouped:
+            self._clear_group_attributes()
+            if self.n_outputs_ != 1:
+                raise ValueError(
+                    "Grouped sampling only supports single-output "
+                    "classification; got "
+                    f"{self.n_outputs_} outputs."
+                )
+            group_info = _check_groups(groups, X.shape[0])
+            self.groups_ = group_info.ids[group_info.codes]
+            self.n_groups_ = group_info.n_groups
+            self._groups_codes_ = group_info.codes
+        else:
+            self._clear_group_attributes()
+
         if isinstance(self.sampling_strategy, dict):
             self._sampling_strategy = {
                 np.where(self.classes_[0] == key)[0][0]: value
@@ -615,7 +703,7 @@ class BalancedRandomForestClassifier(RandomForestClassifier):
         # Check parameters
         self._validate_estimator()
 
-        if not self.bootstrap and self.oob_score:
+        if not grouped and not self.bootstrap and self.oob_score:
             raise ValueError("Out of bag estimation only available if bootstrap=True")
 
         random_state = check_random_state(self.random_state)
@@ -678,6 +766,7 @@ class BalancedRandomForestClassifier(RandomForestClassifier):
                     n_samples_bootstrap=n_samples_bootstrap,
                     forest=self,
                     missing_values_in_feature_mask=missing_values_in_feature_mask,
+                    groups=self.groups_ if grouped else None,
                 )
                 for i, (s, t) in enumerate(zip(samplers, trees))
             )
@@ -727,15 +816,71 @@ class BalancedRandomForestClassifier(RandomForestClassifier):
         y : ndarray of shape (n_samples, n_outputs)
             The target matrix.
         """
-        self.oob_decision_function_ = self._compute_oob_predictions(X, y)
+        if hasattr(self, "_groups_codes_"):
+            self.oob_decision_function_ = self._compute_group_oob_predictions(X, y)
+        else:
+            self.oob_decision_function_ = self._compute_oob_predictions(X, y)
         if self.oob_decision_function_.shape[-1] == 1:
             # drop the n_outputs axis if there is a single output
             self.oob_decision_function_ = self.oob_decision_function_.squeeze(axis=-1)
         from sklearn.metrics import accuracy_score
 
-        self.oob_score_ = accuracy_score(
-            y, np.argmax(self.oob_decision_function_, axis=1)
-        )
+        if hasattr(self, "oob_counts_"):
+            # Rows without any eligible tree are excluded from the score and
+            # their probability vector is NaN.
+            eligible = self.oob_counts_ > 0
+            if not eligible.any():
+                self.oob_score_ = float("nan")
+            else:
+                y_true = np.asarray(y)[eligible]
+                y_pred = np.argmax(self.oob_decision_function_[eligible], axis=1)
+                self.oob_score_ = accuracy_score(y_true.ravel(), y_pred)
+        else:
+            self.oob_score_ = accuracy_score(
+                y, np.argmax(self.oob_decision_function_, axis=1)
+            )
+
+    def _compute_group_oob_predictions(self, X, y):
+        """Compute OOB predictions when whole groups were sampled.
+
+        A tree is allowed to vote for a row only if the row belongs to a group
+        that the tree never selected for training.
+        """
+        if issparse(X):
+            X = X.tocsr()
+
+        n_samples = y.shape[0]
+        n_outputs = self.n_outputs_
+        n_classes = self.n_classes_[0]
+
+        oob_pred = np.zeros((n_samples, n_classes, n_outputs), dtype=np.float64)
+        oob_counts = np.zeros(n_samples, dtype=np.int64)
+
+        for sampler, estimator in zip(self.samplers_, self.estimators_):
+            trained_groups = sampler.group_codes_
+            eligible = ~np.isin(self._groups_codes_, trained_groups)
+            if not eligible.any():
+                continue
+            indices = np.flatnonzero(eligible)
+            y_pred = self._get_oob_predictions(estimator, X[indices, :])
+            oob_pred[indices, ...] += y_pred
+            oob_counts[indices] += 1
+
+        self.oob_counts_ = oob_counts
+        if n_outputs == 1:
+            denominator = oob_counts[:, np.newaxis]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                oob_pred = oob_pred / denominator[..., np.newaxis]
+            # Rows never left out get a NaN probability vector.
+            oob_pred[oob_counts == 0, ...] = np.nan
+        else:  # pragma: no cover - grouped mode is single-output only
+            for k in range(n_outputs):
+                denominator = oob_counts[:, np.newaxis]
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    oob_pred[..., k] /= denominator
+                oob_pred[oob_counts == 0, ..., k] = np.nan
+
+        return oob_pred
 
     def _compute_oob_predictions(self, X, y):
         """Compute and set the OOB score.

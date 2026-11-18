@@ -29,6 +29,14 @@ Enhancements
   the final estimator and exposes the reconciliation in ``resampling_audit_``.
   See :ref:`weight_conservation`.
 
+- Add group-aware under-sampling: :meth:`~imblearn.under_sampling.RandomUnderSampler.fit_resample`
+  and :meth:`~imblearn.ensemble.BalancedRandomForestClassifier.fit` accept a
+  ``groups`` argument so that all rows of a unit (a device, a patient, ...) are
+  kept or left out together.  The forest trains each tree on the rows of its
+  selected groups and only lets a tree vote in the out-of-bag estimate for
+  groups it never saw, exposing ``oob_counts_``.  See :ref:`controlled_under_sampling`
+  and :ref:`forest`.
+
 Compatibility
 .............
 

@@ -1,7 +1,9 @@
 import numpy as np
 import pytest
+from sklearn.base import clone
 from sklearn.datasets import make_classification
 from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.utils._testing import assert_allclose, assert_array_equal
 from sklearn.utils.fixes import parse_version
 
@@ -312,3 +314,374 @@ def test_missing_value_is_predictive():
     assert predictive_test_score >= forest_non_predictive.score(
         X_non_predictive_test, y_test
     )
+
+
+# ---------------------------------------------------------------------------
+# Group-aware sampling
+# ---------------------------------------------------------------------------
+
+
+def _grouped_forest_dataset(n_groups_per_class=(3, 2, 4), rows_per_group=2):
+    """Single-label groups of equal size with imbalanced class counts."""
+    X_rows, y_rows, groups_rows = [], [], []
+    group = 0
+    for label, n_groups in enumerate(n_groups_per_class):
+        for _ in range(n_groups):
+            for _ in range(rows_per_group):
+                X_rows.append(
+                    [
+                        group + 0.5 * label,
+                        float(label),
+                        float(group % 3),
+                    ]
+                )
+                y_rows.append(label)
+                groups_rows.append(group)
+            group += 1
+    return (
+        np.asarray(X_rows, dtype=float),
+        np.asarray(y_rows),
+        np.asarray(groups_rows),
+    )
+
+
+def _fitted_group_forest(X, y, groups, **params):
+    defaults = dict(
+        n_estimators=7,
+        random_state=0,
+        sampling_strategy="auto",
+        replacement=False,
+        bootstrap=False,
+        max_samples=None,
+        warm_start=False,
+    )
+    defaults.update({k: v for k, v in params.items() if k != "sample_weight"})
+    forest = BalancedRandomForestClassifier(**defaults)
+    forest.fit(X, y, sample_weight=params.get("sample_weight"), groups=groups)
+    return forest
+
+
+def test_grouped_forest_samples_rows_of_selected_groups():
+    X, y, groups = _grouped_forest_dataset()
+    forest = _fitted_group_forest(X, y, groups)
+
+    assert forest.n_groups_ == 9
+    assert_array_equal(forest.groups_, groups)
+    assert len(forest.estimators_) == len(forest.samplers_) == 7
+
+    for sampler in forest.samplers_:
+        selected = sampler.group_ids_
+        expected = np.flatnonzero(np.isin(groups, selected))
+        assert_array_equal(sampler.sample_indices_, expected)
+        assert set(np.unique(y[expected])) == {0, 1, 2}
+        # Each row appears at most once and at least one group is held out.
+        assert sampler.sample_indices_.size == len(
+            np.unique(sampler.sample_indices_)
+        )
+        assert len(selected) < forest.n_groups_
+
+
+def test_grouped_forest_class_counts_balanced():
+    X, y, groups = _grouped_forest_dataset()
+    forest = _fitted_group_forest(X, y, groups)
+    for sampler in forest.samplers_:
+        counts = np.bincount(y[sampler.sample_indices_], minlength=3)
+        # Smallest original class has 2 groups * 2 rows = 4 rows, so with
+        # equal-size single-label groups an exact balance is reachable.
+        assert_array_equal(counts, np.array([4, 4, 4]))
+
+
+def test_grouped_forest_trees_select_different_groups():
+    X, y, groups = _grouped_forest_dataset(n_groups_per_class=(4, 4, 4))
+    forest = _fitted_group_forest(X, y, groups, n_estimators=20)
+    selections = {tuple(sorted(s.group_codes_)) for s in forest.samplers_}
+    assert len(selections) > 1
+
+
+def test_grouped_forest_sample_weight_aligned():
+    X, y, groups = _grouped_forest_dataset()
+    weights = np.linspace(0.1, 3.0, X.shape[0])
+
+    forest = _fitted_group_forest(X, y, groups, n_estimators=1)
+    sampler = forest.samplers_[0]
+    tree = forest.estimators_[0]
+    rows = sampler.sample_indices_
+    reference = DecisionTreeClassifier(**{
+        key: value
+        for key, value in tree.get_params().items()
+        if key != "random_state"
+    }, random_state=tree.random_state)
+    reference.fit(X[rows], y[rows], sample_weight=weights[rows])
+    assert_array_equal(tree.predict(X), reference.predict(X))
+
+    # The root node of the tree must have accumulated the weights of the
+    # sampled rows only, in the sampler's order.
+    weighted = _fitted_group_forest(
+        X, y, groups, n_estimators=1, sample_weight=weights
+    )
+    weighted_rows = weighted.samplers_[0].sample_indices_
+    root_weight = weighted.estimators_[0].tree_.weighted_n_node_samples[0]
+    assert_allclose(root_weight, weights[weighted_rows].sum())
+    assert_allclose(weighted.estimators_[0].tree_.n_node_samples[0], len(rows))
+
+
+def test_grouped_forest_oob_counts_and_probabilities_from_scratch():
+    X, y, groups = _grouped_forest_dataset(n_groups_per_class=(3, 2, 4))
+    n_estimators = 8
+    forest = _fitted_group_forest(
+        X, y, groups, n_estimators=n_estimators, oob_score=True
+    )
+
+    n_samples = X.shape[0]
+    n_classes = len(forest.classes_)
+    votes = np.zeros((n_samples, n_classes))
+    counts = np.zeros(n_samples, dtype=int)
+    for sampler, estimator in zip(forest.samplers_, forest.estimators_):
+        eligible = ~np.isin(groups, sampler.group_ids_)
+        counts += eligible
+        votes[eligible] += estimator.predict_proba(X[eligible])
+    assert_array_equal(forest.oob_counts_, counts)
+    # Each tree saw every class (the grouped sampler keeps every class
+    # represented), so the columns follow ``classes_``.
+    for estimator in forest.estimators_:
+        assert_array_equal(estimator.classes_, forest.classes_)
+
+    expected = np.full_like(votes, np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        expected[counts > 0] = votes[counts > 0] / counts[counts > 0, np.newaxis]
+    assert_allclose(forest.oob_decision_function_, expected, equal_nan=True)
+
+    eligible_rows = forest.oob_counts_ > 0
+    predicted = np.argmax(forest.oob_decision_function_[eligible_rows], axis=1)
+    expected_score = np.mean(forest.classes_[predicted] == y[eligible_rows])
+    assert_allclose(forest.oob_score_, expected_score)
+
+
+def test_grouped_forest_oob_partial_zero_votes():
+    # Two groups per class of 2 rows each: the tree keeps one group per class
+    # and leaves the other two groups out.
+    X, y, groups = _grouped_forest_dataset(
+        n_groups_per_class=(2, 2), rows_per_group=2
+    )
+
+    forest = _fitted_group_forest(X, y, groups, n_estimators=1, oob_score=True)
+    trained_rows = np.flatnonzero(
+        np.isin(groups, forest.samplers_[0].group_ids_)
+    )
+    held_out_rows = np.flatnonzero(forest.oob_counts_ == 0)
+    # The rows of the groups the tree trained on get no vote.
+    assert_array_equal(held_out_rows, trained_rows)
+    assert np.isnan(forest.oob_decision_function_[held_out_rows]).all()
+    assert (forest.oob_counts_[held_out_rows] == 0).all()
+    assert np.isfinite(
+        forest.oob_decision_function_[forest.oob_counts_ > 0]
+    ).all()
+    assert np.isfinite(forest.oob_score_)
+
+
+def test_grouped_forest_oob_all_zero_votes_is_nan():
+    X = np.arange(8, dtype=float).reshape(4, 2)
+    y = np.array([0, 0, 1, 1])
+    # A single group cannot be held out: no row is out of bag.
+    forest = _fitted_group_forest(
+        X, y, np.zeros(4, dtype=int), n_estimators=1, oob_score=True
+    )
+    assert (forest.oob_counts_ == 0).all()
+    assert np.isnan(forest.oob_decision_function_).all()
+    assert np.isnan(forest.oob_score_)
+
+
+def test_grouped_forest_reproducible_across_fits_and_n_jobs():
+    X, y, groups = _grouped_forest_dataset(n_groups_per_class=(4, 4, 4))
+    forests = [
+        _fitted_group_forest(
+            X, y, groups, n_estimators=9, oob_score=True, n_jobs=n_jobs
+        )
+        for n_jobs in (1, 1, 2)
+    ]
+    # Re-fitting the same instance gives the same result as a fresh fit.
+    reused = _fitted_group_forest(
+        X, y, groups, n_estimators=9, oob_score=True, n_jobs=1
+    )
+    reused.fit(X, y, groups=groups)
+    forests.append(reused)
+
+    reference = forests[0]
+    for forest in forests[1:]:
+        assert_array_equal(
+            [s.sample_indices_ for s in reference.samplers_],
+            [s.sample_indices_ for s in forest.samplers_],
+        )
+        assert_array_equal(reference.oob_counts_, forest.oob_counts_)
+        assert_allclose(
+            reference.oob_decision_function_,
+            forest.oob_decision_function_,
+            equal_nan=True,
+        )
+        assert_array_equal(reference.predict(X), forest.predict(X))
+        assert_allclose(reference.predict_proba(X), forest.predict_proba(X))
+
+
+def test_grouped_forest_csr_matches_dense():
+    sp = pytest.importorskip("scipy.sparse")
+    X, y, groups = _grouped_forest_dataset()
+    dense = _fitted_group_forest(X, y, groups, oob_score=True)
+    sparse = _fitted_group_forest(sp.csr_matrix(X), y, groups, oob_score=True)
+
+    assert_array_equal(
+        [s.sample_indices_ for s in dense.samplers_],
+        [s.sample_indices_ for s in sparse.samplers_],
+    )
+    assert_allclose(dense.oob_decision_function_, sparse.oob_decision_function_)
+    assert_array_equal(dense.predict(X), sparse.predict(X))
+    assert_allclose(dense.predict_proba(X), sparse.predict_proba(X))
+
+
+def test_grouped_forest_refit_clears_group_state_and_restores_legacy():
+    X, y, groups = _grouped_forest_dataset()
+    forest = _fitted_group_forest(X, y, groups, oob_score=True)
+    assert hasattr(forest, "groups_")
+    assert hasattr(forest, "oob_counts_")
+
+    forest.set_params(sampling_strategy="all", replacement=True, oob_score=False)
+    forest.fit(X, y)
+    for attribute in ("groups_", "_groups_codes_", "n_groups_", "oob_counts_"):
+        assert not hasattr(forest, attribute)
+
+    legacy = BalancedRandomForestClassifier(
+        **{p: getattr(forest, p) for p in forest.get_params(deep=False)}
+    )
+    legacy.fit(X, y)
+    assert_array_equal(forest.predict(X), legacy.predict(X))
+    assert_array_equal(forest.predict_proba(X), legacy.predict_proba(X))
+
+
+@pytest.mark.parametrize(
+    "params, match",
+    [
+        ({"bootstrap": True}, "bootstrap=False"),
+        ({"max_samples": 3}, "max_samples=None"),
+        ({"warm_start": True}, "warm_start=False"),
+        ({"sampling_strategy": "all"}, "sampling_strategy='auto'"),
+        ({"replacement": True}, "replacement=True"),
+    ],
+)
+def test_grouped_forest_unsupported_parameters_raise_before_building(params, match):
+    X, y, groups = _grouped_forest_dataset()
+    forest_params = dict(
+        n_estimators=3,
+        random_state=0,
+        oob_score=True,
+        sampling_strategy="auto",
+        replacement=False,
+        bootstrap=False,
+    )
+    forest_params.update(params)
+    forest = BalancedRandomForestClassifier(**forest_params)
+    with pytest.raises(ValueError, match=match):
+        forest.fit(X, y, groups=groups)
+    assert not hasattr(forest, "estimators_")
+
+
+@pytest.mark.parametrize(
+    "groups, match",
+    [
+        (np.zeros(5, dtype=int), "same number of rows"),
+        (np.zeros((18, 2), dtype=int), "one-dimensional"),
+        (np.array([None] * 18), "NoneType"),
+        (np.array([1.5] * 18), "type float"),
+        (np.array([""] * 18), "empty string"),
+        (np.array([True] * 18), "boolean"),
+    ],
+)
+def test_grouped_forest_invalid_groups(groups, match):
+    X, y, _ = _grouped_forest_dataset()
+    forest = BalancedRandomForestClassifier(
+        n_estimators=3,
+        sampling_strategy="auto",
+        replacement=False,
+        bootstrap=False,
+    )
+    with pytest.raises(ValueError, match=match):
+        forest.fit(X, y, groups=groups)
+    assert not hasattr(forest, "estimators_")
+
+
+def test_grouped_forest_mixed_group_approximate_balance():
+    # Group 0 is pure class 0 (4 rows), group 1 pure class 1 (2 rows), group 2
+    # mixes both classes and group 3 has two rows of each class.
+    y = np.array([0] * 4 + [1] * 2 + [0, 1] + [0, 0, 1, 1])
+    groups = np.repeat(np.arange(4), [4, 2, 2, 4])
+    X = np.column_stack([np.arange(y.size, dtype=float), groups.astype(float)])
+    forest = _fitted_group_forest(X, y, groups, n_estimators=5, oob_score=True)
+
+    for sampler in forest.samplers_:
+        assert set(np.unique(y[sampler.sample_indices_])) == {0, 1}
+        expected = np.flatnonzero(np.isin(groups, sampler.group_ids_))
+        assert_array_equal(sampler.sample_indices_, expected)
+        assert len(sampler.group_ids_) < 4
+    assert np.isfinite(forest.oob_score_)
+
+
+def test_grouped_forest_legacy_path_unchanged():
+    X, y, _ = _grouped_forest_dataset()
+    params = dict(
+        n_estimators=5,
+        random_state=0,
+        sampling_strategy="all",
+        replacement=True,
+        bootstrap=False,
+    )
+    omitted = BalancedRandomForestClassifier(**params).fit(X, y)
+    explicit_none = BalancedRandomForestClassifier(**params).fit(X, y, groups=None)
+    assert_array_equal(
+        [s.sample_indices_ for s in omitted.samplers_],
+        [s.sample_indices_ for s in explicit_none.samplers_],
+    )
+    assert_array_equal(omitted.predict(X), explicit_none.predict(X))
+    assert not hasattr(omitted, "groups_")
+
+
+def test_grouped_forest_oob_uses_classes_column_order():
+    X, y_int, groups = _grouped_forest_dataset()
+    names = {0: "minority", 1: "middle", 2: "majority"}
+    y = np.array([names[label] for label in y_int])
+    forest = _fitted_group_forest(X, y, groups, n_estimators=6, oob_score=True)
+    # ``classes_`` is sorted, so its order differs from the class codes.
+    assert list(forest.classes_) == ["majority", "middle", "minority"]
+
+    votes = np.zeros((X.shape[0], len(forest.classes_)))
+    counts = np.zeros(X.shape[0], dtype=int)
+    for sampler, estimator in zip(forest.samplers_, forest.estimators_):
+        eligible = ~np.isin(groups, sampler.group_ids_)
+        counts += eligible
+        votes[eligible] += estimator.predict_proba(X[eligible])
+    expected = np.full_like(votes, np.nan)
+    mask = counts > 0
+    expected[mask] = votes[mask] / counts[mask, np.newaxis]
+    assert_allclose(forest.oob_decision_function_, expected, equal_nan=True)
+
+
+def test_grouped_forest_oob_probabilities_sum_to_one():
+    X, y, groups = _grouped_forest_dataset(n_groups_per_class=(3, 2, 4))
+    forest = _fitted_group_forest(X, y, groups, n_estimators=10, oob_score=True)
+    voted = forest.oob_counts_ > 0
+    assert_allclose(forest.oob_decision_function_[voted].sum(axis=1), 1.0)
+    # Every tree sees every class, hence all rows of a selected group are
+    # trained on and cannot be voted on by that tree.
+    for sampler in forest.samplers_:
+        trained_rows = np.flatnonzero(np.isin(groups, sampler.group_ids_))
+        assert trained_rows.size == sampler.sample_indices_.size
+
+
+def test_grouped_forest_clone_and_pipeline_unchanged():
+    X, y, groups = _grouped_forest_dataset()
+    forest = _fitted_group_forest(X, y, groups, n_estimators=3)
+    cloned = clone(forest)
+    cloned.fit(X, y, groups=groups)
+    assert_array_equal(forest.predict(X), cloned.predict(X))
+    # The fitted pipeline of a tree exposes the usual predict API.
+    assert_array_equal(
+        forest.pipelines_[0].predict(X), forest.estimators_[0].predict(X)
+    )
+    assert forest.predict_proba(X).shape == (X.shape[0], len(forest.classes_))

@@ -156,6 +156,38 @@ undersampling::
   >>> df_resampled, y_resampled = rus.fit_resample(df_adult, y_adult)
   >>> df_resampled.head()  # doctest: +SKIP
 
+Group-aware random under-sampling
+"""""""""""""""""""""""""""""""""
+
+When several rows belong to the same unit -- a device, a patient, a session --
+removing individual rows leaks information between the training and the
+evaluation data: a model can memorise a unit from some of its rows and then
+score another row of the same unit.  Pass a ``groups`` identifier for every row
+to keep or remove whole units::
+
+  >>> import numpy as np
+  >>> groups = np.repeat(np.arange(10), X.shape[0] // 10)
+  >>> rus = RandomUnderSampler(random_state=0)
+  >>> X_resampled, y_resampled = rus.fit_resample(X, y, groups=groups)
+  >>> np.array_equal(
+  ...     rus.sample_indices_,
+  ...     np.flatnonzero(np.isin(groups, rus.group_ids_)),
+  ... )
+  True
+
+Each group is selected or left out as a whole and no row is selected twice.  The
+target of every class is the number of rows of the smallest class, so classes
+may remain uneven when a group mixes several labels: dropping such a group
+moves every one of its labels at once.  The selection minimises the total L1
+distance between the selected class counts and that target, subject to keeping
+every class represented and holding out at least one group whenever the
+remaining groups still cover every class.  With single-label groups of equal
+size the balance is exact whenever it is reachable; otherwise the deviation is
+visible in the actual class counts.  Grouping requires
+``sampling_strategy='auto'`` and ``replacement=False``.  The same rule is used
+by :class:`~imblearn.ensemble.BalancedRandomForestClassifier`; see
+:ref:`forest` for the out-of-bag semantics.
+
 :class:`NearMiss` adds some heuristic rules to select samples
 :cite:`mani2003knn`. :class:`NearMiss` implements 3 different types of
 heuristic which can be selected with the parameter ``version``::

@@ -86,6 +86,35 @@ each tree of the forest will be provided a balanced bootstrap sample
   >>> balanced_accuracy_score(y_test, y_pred)
   0.8...
 
+Group-aware balanced random forest
+""""""""""""""""""""""""""""""""""
+
+When a unit such as a device leaves several rows, pass ``groups`` to ``fit`` to
+select whole units for every tree.  Grouped mode requires
+``sampling_strategy='auto'``, ``replacement=False``, ``bootstrap=False``,
+``max_samples=None`` and ``warm_start=False``::
+
+  >>> import numpy as np
+  >>> groups = np.repeat(np.arange(X_train.shape[0] // 10), 10)
+  >>> brf = BalancedRandomForestClassifier(
+  ...     n_estimators=50, random_state=0, sampling_strategy="auto",
+  ...     replacement=False, bootstrap=False, oob_score=True,
+  ... )
+  >>> brf.fit(X_train, y_train, groups=groups)
+  BalancedRandomForestClassifier(...)
+
+Each tree is trained on exactly the original rows kept by its
+``samplers_[i]``; ``samplers_[i].sample_indices_`` lists them and
+``samplers_[i].group_ids_`` lists the selected groups.  Since no row of a group
+selected by a tree may be scored by that tree, the out-of-bag estimate only
+uses trees that never saw the row's group.  ``oob_counts_`` reports the number
+of such trees per row, ``oob_decision_function_`` averages their probabilities
+(in ``classes_`` order) and is NaN for rows without any eligible tree.
+``oob_score_`` skips those rows and is NaN when no row is eligible.  Because
+trees are trained on disjoint groups, an honest estimate of the performance on
+an unseen device needs a group-level split; this mode removes the
+within-device leakage between the training rows and the out-of-bag rows.
+
 .. _boosting:
 
 Boosting

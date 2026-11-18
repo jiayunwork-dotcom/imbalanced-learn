@@ -6,9 +6,11 @@
 
 import numpy as np
 from sklearn.utils import _safe_indexing, check_random_state
+from sklearn.utils.validation import _num_samples
 
 from ...utils import Substitution, check_target_type
 from ...utils._docstring import _random_state_docstring
+from ...utils._group_sampling import _check_groups, _select_groups
 from ...utils._sklearn_compat import validate_data
 from ...utils._validation import _check_X
 from ..base import BaseUnderSampler
@@ -47,6 +49,20 @@ class RandomUnderSampler(BaseUnderSampler):
 
         .. versionadded:: 0.4
 
+    groups_ : ndarray of shape (n_samples,)
+        Group identifier of each input row, as validated. Only defined when
+        ``groups`` is passed to :meth:`fit_resample`.
+
+    group_ids_ : ndarray of shape (n_selected_groups,)
+        Identifiers of the groups kept in the training data.
+
+    group_codes_ : ndarray of shape (n_selected_groups,)
+        Integer codes of the groups kept in the training data. The codes refer
+        to the order of first appearance of the groups in ``groups``.
+
+    n_groups_ : int
+        Total number of groups seen in the input.
+
     n_features_in_ : int
         Number of features in the input dataset.
 
@@ -67,6 +83,12 @@ class RandomUnderSampler(BaseUnderSampler):
     Supports multi-class resampling by sampling each class independently.
     Supports heterogeneous data as object array containing string and numeric
     data.
+
+    Whole groups can be under-sampled instead of individual rows by passing
+    ``groups`` to :meth:`fit_resample`.  In that mode each group is kept or
+    dropped as a whole, the target of every class is the number of rows of the
+    smallest class, and each class stays represented.  Grouping requires
+    ``sampling_strategy='auto'`` and ``replacement=False``.
 
     Examples
     --------
@@ -97,13 +119,91 @@ class RandomUnderSampler(BaseUnderSampler):
         self.random_state = random_state
         self.replacement = replacement
 
+    def fit_resample(self, X, y, *, groups=None):
+        """Resample the dataset.
+
+        Parameters
+        ----------
+        X : {array-like, dataframe, sparse matrix} of shape \
+                (n_samples, n_features)
+            Matrix containing the data which have to be sampled.
+
+        y : array-like of shape (n_samples,)
+            Corresponding label for each sample in X.
+
+        groups : array-like of shape (n_samples,), default=None
+            Integer or non-empty string identifier of the group of each row.
+            When provided, whole groups are selected or left out together.  The
+            target of each class is the number of rows of the smallest class in
+            the input.  ``None`` keeps the historical row-wise behaviour.
+
+        Returns
+        -------
+        X_resampled : {array-like, dataframe, sparse matrix} of shape \
+                (n_samples_new, n_features)
+            The array containing the resampled data.
+
+        y_resampled : array-like of shape (n_samples_new,)
+            The corresponding label of `X_resampled`.
+        """
+        if groups is None:
+            return super().fit_resample(X, y)
+        return super().fit_resample(X, y, groups=groups)
+
     def _check_X_y(self, X, y):
         y, binarize_y = check_target_type(y, indicate_one_vs_all=True)
         X = _check_X(X)
         X, y = validate_data(self, X=X, y=y, reset=True, skip_check_array=True)
         return X, y, binarize_y
 
-    def _fit_resample(self, X, y):
+    def _validate_group_parameters(self):
+        """Check the parameters that only make sense in grouped mode."""
+        if self.sampling_strategy != "auto":
+            raise ValueError(
+                "Grouped under-sampling only supports "
+                "sampling_strategy='auto'; got "
+                f"{self.sampling_strategy!r}."
+            )
+        if self.replacement:
+            raise ValueError(
+                "Grouped under-sampling does not support replacement=True."
+            )
+
+    def _fit_resample_groups(self, X, y, groups):
+        """Under-sample by dropping whole groups."""
+        info = _check_groups(groups, _num_samples(X))
+        self._validate_group_parameters()
+
+        self.groups_ = info.ids[info.codes]
+        self.n_groups_ = info.n_groups
+
+        selected, counts, _ = _select_groups(
+            y, info.codes, info.n_groups, random_state=self.random_state
+        )
+
+        selected_codes = np.flatnonzero(selected)
+        self.group_codes_ = selected_codes
+        self.group_ids_ = info.ids[selected_codes]
+
+        mask = np.isin(info.codes, selected_codes)
+        idx_under = np.flatnonzero(mask)
+        self.sample_indices_ = idx_under
+
+        return _safe_indexing(X, idx_under), _safe_indexing(y, idx_under)
+
+    def _fit_resample(self, X, y, groups=None):
+        if groups is not None:
+            return self._fit_resample_groups(X, y, groups)
+        # A previous fit in grouped mode must not leak its attributes.
+        for attribute in (
+            "groups_",
+            "group_ids_",
+            "group_codes_",
+            "n_groups_",
+        ):
+            if hasattr(self, attribute):
+                delattr(self, attribute)
+
         random_state = check_random_state(self.random_state)
 
         idx_under = np.empty((0,), dtype=int)
