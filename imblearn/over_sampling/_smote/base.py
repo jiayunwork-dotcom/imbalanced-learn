@@ -27,11 +27,18 @@ from sklearn.utils.sparsefuncs_fast import (
 )
 from sklearn.utils.validation import _num_features
 
+from ...base import _document_fit_resample_weighted, _fit_resample_weighted
 from ...metrics.pairwise import ValueDifferenceMetric
 from ...utils import Substitution, check_neighbors_object, check_target_type
 from ...utils._docstring import _random_state_docstring
-from ...utils._sklearn_compat import _get_column_indices, _is_pandas_df, validate_data
+from ...utils._sklearn_compat import (
+    _fit_context,
+    _get_column_indices,
+    _is_pandas_df,
+    validate_data,
+)
 from ...utils._validation import _check_X
+from ...utils._weight_accounting import WeightContributions
 from ..base import BaseOverSampler
 
 
@@ -107,6 +114,29 @@ class BaseSMOTE(BaseOverSampler):
         y_new : ndarray of shape (n_samples_new,)
             Target values for synthetic samples.
         """
+        X_new, y_new, _ = self._make_samples_with_provenance(
+            X, y_dtype, y_type, nn_data, nn_num, n_samples, step_size=step_size, y=y
+        )
+        return X_new, y_new
+
+    def _make_samples_with_provenance(
+        self, X, y_dtype, y_type, nn_data, nn_num, n_samples, step_size=1.0, y=None
+    ):
+        """Variant of `_make_samples` also returning the generating endpoints.
+
+        Returns
+        -------
+        X_new : {ndarray, sparse matrix} of shape (n_samples_new, n_features)
+            Synthetically generated samples.
+
+        y_new : ndarray of shape (n_samples_new,)
+            Target values for synthetic samples.
+
+        endpoints : tuple of ndarray
+            ``(rows, cols)`` such that the k-th synthetic sample was
+            generated from the base point ``X[rows[k]]`` and its neighbour
+            ``nn_data[nn_num[rows[k], cols[k]]]``.
+        """
         random_state = check_random_state(self.random_state)
         samples_indices = random_state.randint(low=0, high=nn_num.size, size=n_samples)
 
@@ -117,7 +147,7 @@ class BaseSMOTE(BaseOverSampler):
 
         X_new = self._generate_samples(X, nn_data, nn_num, rows, cols, steps, y_type, y)
         y_new = np.full(n_samples, fill_value=y_type, dtype=y_dtype)
-        return X_new, y_new
+        return X_new, y_new, (rows, cols)
 
     def _generate_samples(
         self, X, nn_data, nn_num, rows, cols, steps, y_type=None, y=None
@@ -330,6 +360,8 @@ class SMOTE(BaseSMOTE):
     Resampled dataset shape Counter({{0: 900, 1: 900}})
     """
 
+    _weighted_resampling_supported = True
+
     def __init__(
         self,
         *,
@@ -344,10 +376,27 @@ class SMOTE(BaseSMOTE):
         )
 
     def _fit_resample(self, X, y):
+        X_resampled, y_resampled, _ = self._fit_resample_with_endpoints(X, y)
+        return X_resampled, y_resampled
+
+    def _fit_resample_with_endpoints(self, X, y):
+        """Variant of `_fit_resample` also returning the generating endpoints.
+
+        Returns
+        -------
+        X_resampled, y_resampled
+            The resampled data, identical to `_fit_resample`.
+
+        endpoints : ndarray of shape (n_samples_new, 2), dtype=int64
+            For each synthetic sample, in output order, the positional
+            indices in the original `X` of the two observations that
+            generated it (the base point and the selected neighbour).
+        """
         self._validate_estimator()
 
         X_resampled = [X.copy()]
         y_resampled = [y.copy()]
+        endpoints = []
 
         for class_sample, n_samples in self.sampling_strategy_.items():
             if n_samples == 0:
@@ -357,8 +406,16 @@ class SMOTE(BaseSMOTE):
 
             self.nn_k_.fit(X_class)
             nns = self.nn_k_.kneighbors(X_class, return_distance=False)[:, 1:]
-            X_new, y_new = self._make_samples(
+            X_new, y_new, (rows, cols) = self._make_samples_with_provenance(
                 X_class, y.dtype, class_sample, X_class, nns, n_samples, 1.0
+            )
+            endpoints.append(
+                np.column_stack(
+                    [
+                        target_class_indices[rows],
+                        target_class_indices[nns[rows, cols]],
+                    ]
+                ).astype(np.int64, copy=False)
             )
             X_resampled.append(X_new)
             y_resampled.append(y_new)
@@ -368,8 +425,59 @@ class SMOTE(BaseSMOTE):
         else:
             X_resampled = np.vstack(X_resampled)
         y_resampled = np.hstack(y_resampled)
+        if endpoints:
+            endpoints = np.vstack(endpoints)
+        else:
+            endpoints = np.empty((0, 2), dtype=np.int64)
 
-        return X_resampled, y_resampled
+        return X_resampled, y_resampled, endpoints
+
+    @_fit_context(prefer_skip_nested_validation=True)
+    @_document_fit_resample_weighted
+    def fit_resample_weighted(self, X, y, sample_weight):
+        return _fit_resample_weighted(self, X, y, sample_weight)
+
+    def _fit_resample_flow(self, X, y, sample_weight):
+        """Resample and record how the weight of each input row is spent.
+
+        Each original row funds its own kept row and the synthetic samples
+        for which it was one of the two generating endpoints, splitting its
+        weight equally between them. A synthetic sample is funded by its two
+        endpoints only and receives one share from each.
+        """
+        X_resampled, y_resampled, endpoints = self._fit_resample_with_endpoints(X, y)
+
+        n_inputs = X.shape[0]
+        n_synthetic = endpoints.shape[0]
+        n_outputs = n_inputs + n_synthetic
+        # each input row funds its kept row plus one share per synthetic
+        # sample it contributed to as an endpoint
+        n_funded = np.ones(n_inputs, dtype=np.int64)
+        if n_synthetic:
+            n_funded += np.bincount(endpoints.ravel(), minlength=n_inputs)
+        shares = sample_weight / n_funded
+
+        input_index = np.concatenate(
+            [np.arange(n_inputs, dtype=np.int64), endpoints[:, 0], endpoints[:, 1]]
+        )
+        output_index = np.concatenate(
+            [
+                np.arange(n_inputs, dtype=np.int64),
+                np.tile(np.arange(n_inputs, n_outputs, dtype=np.int64), 2),
+            ]
+        )
+        mass = np.concatenate(
+            [shares, shares[endpoints[:, 0]], shares[endpoints[:, 1]]]
+        )
+        contributions = WeightContributions(
+            input_index,
+            output_index,
+            mass,
+            n_inputs=n_inputs,
+            n_outputs=n_outputs,
+        )
+        dropped_weight = np.zeros(n_inputs, dtype=np.float64)
+        return X_resampled, y_resampled, contributions, dropped_weight
 
 
 @Substitution(

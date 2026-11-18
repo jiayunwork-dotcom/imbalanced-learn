@@ -19,6 +19,28 @@ Validation checks used in samplers
    check_sampling_strategy
    check_target_type
 
+Weight-conserving resampling
+----------------------------
+
+Bookkeeping used by ``fit_resample_weighted`` and by
+``Pipeline(weight_resampling='conserve')``. See
+:ref:`weight_conservation` for the user guide.
+
+.. autosummary::
+   :toctree: generated/
+   :template: class.rst
+
+   WeightContributions
+   WeightedResamplingResult
+   ResamplingAudit
+
+.. autosummary::
+   :toctree: generated/
+   :template: function.rst
+
+   compose_weighted_results
+   validate_sample_weight
+
 Testing compatibility of your own sampler
 -----------------------------------------
 

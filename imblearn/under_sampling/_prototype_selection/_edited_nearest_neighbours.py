@@ -14,8 +14,11 @@ from scipy.stats import mode
 from sklearn.utils import _safe_indexing
 from sklearn.utils._param_validation import HasMethods, Interval, StrOptions
 
+from ...base import _document_fit_resample_weighted, _fit_resample_weighted
 from ...utils import Substitution, check_neighbors_object
 from ...utils._docstring import _n_jobs_docstring
+from ...utils._sklearn_compat import _fit_context
+from ...utils._weight_accounting import WeightContributions
 from ..base import BaseCleaningSampler
 
 SEL_KIND = ("all", "mode")
@@ -133,6 +136,8 @@ class EditedNearestNeighbours(BaseCleaningSampler):
         "n_jobs": [numbers.Integral, None],
     }
 
+    _weighted_resampling_supported = True
+
     def __init__(
         self,
         *,
@@ -188,6 +193,33 @@ class EditedNearestNeighbours(BaseCleaningSampler):
         self.sample_indices_ = idx_under
 
         return _safe_indexing(X, idx_under), _safe_indexing(y, idx_under)
+
+    @_fit_context(prefer_skip_nested_validation=True)
+    @_document_fit_resample_weighted
+    def fit_resample_weighted(self, X, y, sample_weight):
+        return _fit_resample_weighted(self, X, y, sample_weight)
+
+    def _fit_resample_flow(self, X, y, sample_weight):
+        """Resample and record how the weight of each input row is spent.
+
+        A kept row funds only itself and keeps its whole weight. The weight
+        of a removed row is recorded as dropped mass: it is neither
+        redistributed to the survivors nor renormalized.
+        """
+        X_resampled, y_resampled = self._fit_resample(X, y)
+
+        n_inputs = X.shape[0]
+        kept = np.asarray(self.sample_indices_, dtype=np.int64)
+        contributions = WeightContributions(
+            kept,
+            np.arange(kept.size, dtype=np.int64),
+            sample_weight[kept],
+            n_inputs=n_inputs,
+            n_outputs=kept.size,
+        )
+        dropped_weight = sample_weight.copy()
+        dropped_weight[kept] = 0.0
+        return X_resampled, y_resampled, contributions, dropped_weight
 
     def _more_tags(self):
         return {"sample_indices": True}

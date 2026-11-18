@@ -9,12 +9,14 @@ import numbers
 from sklearn.base import clone
 from sklearn.utils import check_X_y
 
-from ..base import BaseSampler
+from ..base import BaseSampler, _document_fit_resample_weighted, _fit_resample_weighted
 from ..over_sampling import SMOTE
 from ..over_sampling.base import BaseOverSampler
 from ..under_sampling import EditedNearestNeighbours
 from ..utils import Substitution, check_target_type
 from ..utils._docstring import _n_jobs_docstring, _random_state_docstring
+from ..utils._sklearn_compat import _fit_context
+from ..utils._weight_accounting import compose_weighted_results
 
 
 @Substitution(
@@ -117,6 +119,8 @@ class SMOTEENN(BaseSampler):
         "n_jobs": [numbers.Integral, None],
     }
 
+    _weighted_resampling_supported = True
+
     def __init__(
         self,
         *,
@@ -158,3 +162,31 @@ class SMOTEENN(BaseSampler):
 
         X_res, y_res = self.smote_.fit_resample(X, y)
         return self.enn_.fit_resample(X_res, y_res)
+
+    @_fit_context(prefer_skip_nested_validation=True)
+    @_document_fit_resample_weighted
+    def fit_resample_weighted(self, X, y, sample_weight):
+        return _fit_resample_weighted(self, X, y, sample_weight)
+
+    def _fit_resample_flow(self, X, y, sample_weight):
+        """Resample and record how the weight of each input row is spent.
+
+        The bookkeeping of the SMOTE stage and of the ENN stage are composed
+        so that the resulting transfers are rooted at the original input
+        rows, exactly as an explicit weighted SMOTE followed by a weighted
+        ENN with the same parameters and random state.
+        """
+        self._validate_estimator()
+        y = check_target_type(y)
+        X, y = check_X_y(X, y, accept_sparse=["csr", "csc"])
+        self.sampling_strategy_ = self.sampling_strategy
+
+        first = self.smote_.fit_resample_weighted(X, y, sample_weight)
+        second = self.enn_.fit_resample_weighted(first.X, first.y, first.sample_weight)
+        combined = compose_weighted_results(first, second)
+        return (
+            combined.X,
+            combined.y,
+            combined.contributions,
+            combined.dropped_weight,
+        )

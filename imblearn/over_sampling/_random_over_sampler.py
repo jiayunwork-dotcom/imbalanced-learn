@@ -13,10 +13,12 @@ from sklearn.utils import _safe_indexing, check_array, check_random_state
 from sklearn.utils._param_validation import Interval
 from sklearn.utils.sparsefuncs import mean_variance_axis
 
+from ..base import _document_fit_resample_weighted, _fit_resample_weighted
 from ..utils import Substitution, check_target_type
 from ..utils._docstring import _random_state_docstring
-from ..utils._sklearn_compat import validate_data
+from ..utils._sklearn_compat import _fit_context, validate_data
 from ..utils._validation import _check_X
+from ..utils._weight_accounting import WeightContributions
 from .base import BaseOverSampler
 
 
@@ -143,6 +145,8 @@ class RandomOverSampler(BaseOverSampler):
         "shrinkage": [Interval(Real, 0, None, closed="left"), dict, None],
     }
 
+    _weighted_resampling_supported = True
+
     def __init__(
         self,
         *,
@@ -248,6 +252,42 @@ class RandomOverSampler(BaseOverSampler):
         y_resampled = np.hstack(y_resampled)
 
         return X_resampled, y_resampled
+
+    @_fit_context(prefer_skip_nested_validation=True)
+    @_document_fit_resample_weighted
+    def fit_resample_weighted(self, X, y, sample_weight):
+        return _fit_resample_weighted(self, X, y, sample_weight)
+
+    def _fit_resample_flow(self, X, y, sample_weight):
+        """Resample and record how the weight of each input row is spent.
+
+        Every output row of the plain bootstrap is a copy of a single input
+        row (``sample_indices_``), so each input row funds exactly the output
+        rows copied from it and splits its weight equally between them.
+        """
+        if self.shrinkage is not None:
+            raise ValueError(
+                "fit_resample_weighted only supports shrinkage=None. The "
+                "smoothed bootstrap generated with a shrinkage factor does "
+                "not record weight provenance."
+            )
+        X_resampled, y_resampled = self._fit_resample(X, y)
+
+        n_inputs = X.shape[0]
+        sources = np.asarray(self.sample_indices_, dtype=np.int64)
+        n_outputs = sources.shape[0]
+        # an input row funds as many output rows as it was copied into
+        n_copies = np.bincount(sources, minlength=n_inputs)
+        mass = sample_weight[sources] / n_copies[sources]
+        contributions = WeightContributions(
+            sources,
+            np.arange(n_outputs, dtype=np.int64),
+            mass,
+            n_inputs=n_inputs,
+            n_outputs=n_outputs,
+        )
+        dropped_weight = np.zeros(n_inputs, dtype=np.float64)
+        return X_resampled, y_resampled, contributions, dropped_weight
 
     def _more_tags(self):
         return {

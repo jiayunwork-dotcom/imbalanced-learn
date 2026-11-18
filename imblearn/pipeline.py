@@ -13,15 +13,17 @@ composite estimator, as a chain of transforms, samples and estimators.
 #         Christos Aridas
 #         Guillaume Lemaitre <g.lemaitre58@gmail.com>
 # License: BSD
+import inspect
 import warnings
 from contextlib import contextmanager
 from copy import deepcopy
 
+import numpy as np
 from sklearn import pipeline
 from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 from sklearn.utils import Bunch
-from sklearn.utils._param_validation import HasMethods
+from sklearn.utils._param_validation import HasMethods, StrOptions
 from sklearn.utils.fixes import parse_version
 from sklearn.utils.metadata_routing import (
     MetadataRouter,
@@ -30,9 +32,9 @@ from sklearn.utils.metadata_routing import (
     get_routing_for_object,
 )
 from sklearn.utils.metaestimators import available_if
-from sklearn.utils.validation import check_is_fitted, check_memory
+from sklearn.utils.validation import _num_samples, check_is_fitted, check_memory
 
-from .base import METHODS
+from .base import METHODS, _supports_weighted_resampling
 from .utils._sklearn_compat import (
     _fit_context,
     _print_elapsed_time,
@@ -41,6 +43,11 @@ from .utils._sklearn_compat import (
     process_routing,
     sklearn_version,
     validate_params,
+)
+from .utils._weight_accounting import (
+    ResamplingAudit,
+    WeightContributions,
+    validate_sample_weight,
 )
 
 __all__ = ["Pipeline", "make_pipeline"]
@@ -165,6 +172,28 @@ class Pipeline(pipeline.Pipeline):
         If True, the time elapsed while fitting each step will be printed as it
         is completed.
 
+    weight_resampling : {'conserve'}, default=None
+        Enable weight-conserving resampling when calling :meth:`fit` with a
+        ``sample_weight`` argument:
+
+        - if `None` (default), the pipeline behaves as usual and
+          ``sample_weight`` is routed like any other metadata;
+        - if `'conserve'`, the ``sample_weight`` passed to :meth:`fit` is
+          validated and carried through the samplers of the pipeline with
+          :meth:`fit_resample_weighted`: each original observation keeps
+          track of the mass it hands to the resampled rows. The weights of
+          the final training rows are handed to the final estimator and the
+          reconciliation is stored in :term:`resampling_audit_`.
+
+        Transformers that preserve the row order (e.g.
+        `~sklearn.preprocessing.StandardScaler`, `'passthrough'`) can be
+        interleaved with the samplers. All samplers in the pipeline must
+        implement `fit_resample_weighted` and the final estimator must
+        accept a `sample_weight` parameter in its `fit` method, otherwise an
+        error is raised.
+
+        .. versionadded:: 0.14
+
     Attributes
     ----------
     named_steps : :class:`~sklearn.utils.Bunch`
@@ -180,6 +209,13 @@ class Pipeline(pipeline.Pipeline):
     feature_names_in_ : ndarray of shape (`n_features_in_`,)
         Names of features seen during :term:`fit`. Only defined if the
         underlying estimator exposes such an attribute when fit.
+
+    resampling_audit_ : ResamplingAudit
+        The weight-conservation reconciliation of the last call to
+        :meth:`fit`, rooted at the rows passed to :meth:`fit`. Only present
+        when ``weight_resampling='conserve'``.
+
+        .. versionadded:: 0.14
 
     See Also
     --------
@@ -241,13 +277,23 @@ class Pipeline(pipeline.Pipeline):
         "transform_input": [list, None],
         "memory": [None, str, HasMethods(["cache"])],
         "verbose": ["boolean"],
+        "weight_resampling": [None, StrOptions({"conserve"})],
     }
 
-    def __init__(self, steps, *, transform_input=None, memory=None, verbose=False):
+    def __init__(
+        self,
+        steps,
+        *,
+        transform_input=None,
+        memory=None,
+        verbose=False,
+        weight_resampling=None,
+    ):
         self.steps = steps
         self.transform_input = transform_input
         self.memory = memory
         self.verbose = verbose
+        self.weight_resampling = weight_resampling
 
     # BaseEstimator interface
 
@@ -394,8 +440,39 @@ class Pipeline(pipeline.Pipeline):
 
     # Estimator interface
 
+    def _validate_weight_conserve_setup(self):
+        """Check that the pipeline can run with `weight_resampling='conserve'`.
+
+        All samplers must implement `fit_resample_weighted` and the final
+        estimator must accept `sample_weight` in its `fit` method.
+        """
+        for name, step in self.steps[:-1]:
+            if step is None or step == "passthrough":
+                continue
+            if hasattr(step, "fit_resample") and not _supports_weighted_resampling(
+                step
+            ):
+                raise TypeError(
+                    "weight_resampling='conserve' requires every sampler of "
+                    "the pipeline to implement fit_resample_weighted. Step "
+                    f"{name!r} ({type(step).__name__}) does not support it. "
+                    "Supported samplers are RandomOverSampler (with "
+                    "shrinkage=None), SMOTE, EditedNearestNeighbours and "
+                    "SMOTEENN."
+                )
+        final_estimator = self._final_estimator
+        if final_estimator is not None and final_estimator != "passthrough":
+            fit_parameters = inspect.signature(final_estimator.fit).parameters
+            if "sample_weight" not in fit_parameters:
+                raise TypeError(
+                    "weight_resampling='conserve' hands the conserved weights "
+                    "to the final estimator, but the fit method of "
+                    f"{type(final_estimator).__name__} does not accept a "
+                    "sample_weight parameter."
+                )
+
     # def _fit(self, X, y=None, **fit_params_steps):
-    def _fit(self, X, y=None, routed_params=None, raw_params=None):
+    def _fit(self, X, y=None, routed_params=None, raw_params=None, sample_weight=None):
         self.steps = list(self.steps)
         self._validate_steps()
         # Setup the memory
@@ -403,6 +480,18 @@ class Pipeline(pipeline.Pipeline):
 
         fit_transform_one_cached = memory.cache(_fit_transform_one)
         fit_resample_one_cached = memory.cache(_fit_resample_one)
+        fit_resample_weighted_one_cached = memory.cache(_fit_resample_weighted_one)
+
+        # When conserving weights, thread the per-row weights and the
+        # input-to-output transfers through the samplers. The accounting is
+        # rooted at the rows passed to `fit` and is stored transiently on
+        # `self._fit_weight_accounting` for `fit` to pick up.
+        conserve = self.weight_resampling == "conserve" and sample_weight is not None
+        self._fit_weight_accounting = None
+        if conserve:
+            current_weight = sample_weight
+            flow_total = None
+            dropped_total = np.zeros(sample_weight.shape[0], dtype=np.float64)
 
         for step_idx, name, transformer in self._iter(
             with_final=False, filter_passthrough=False, filter_resample=False
@@ -437,18 +526,62 @@ class Pipeline(pipeline.Pipeline):
                     params=step_params,
                 )
             elif hasattr(cloned_transformer, "fit_resample"):
-                X, y, fitted_transformer = fit_resample_one_cached(
-                    cloned_transformer,
-                    X,
-                    y,
-                    message_clsname="Pipeline",
-                    message=self._log_message(step_idx),
-                    params=routed_params[name],
-                )
+                if conserve:
+                    (
+                        X,
+                        y,
+                        current_weight,
+                        flow_step,
+                        dropped_step,
+                        fitted_transformer,
+                    ) = fit_resample_weighted_one_cached(
+                        cloned_transformer,
+                        X,
+                        y,
+                        current_weight,
+                        message_clsname="Pipeline",
+                        message=self._log_message(step_idx),
+                        params=routed_params[name],
+                    )
+                    if flow_total is None:
+                        flow_total = flow_step
+                        dropped_total = dropped_step
+                    else:
+                        dropped_total = dropped_total + flow_total.lift_dropped(
+                            dropped_step
+                        )
+                        flow_total = flow_total.compose(flow_step)
+                else:
+                    X, y, fitted_transformer = fit_resample_one_cached(
+                        cloned_transformer,
+                        X,
+                        y,
+                        message_clsname="Pipeline",
+                        message=self._log_message(step_idx),
+                        params=routed_params[name],
+                    )
             # Replace the transformer of the step with the fitted
             # transformer. This is necessary when loading the transformer
             # from the cache.
             self.steps[step_idx] = (name, fitted_transformer)
+
+        if conserve:
+            if flow_total is None:
+                # no sampler in the pipeline: the weights pass through
+                n_rows = sample_weight.shape[0]
+                flow_total = WeightContributions(
+                    np.arange(n_rows, dtype=np.int64),
+                    np.arange(n_rows, dtype=np.int64),
+                    current_weight,
+                    n_inputs=n_rows,
+                    n_outputs=n_rows,
+                )
+                dropped_total = np.zeros(n_rows, dtype=np.float64)
+            self._fit_weight_accounting = (
+                current_weight,
+                flow_total,
+                dropped_total,
+            )
         return X, y
 
     # The `fit_*` methods need to be overridden to support the samplers.
@@ -492,6 +625,16 @@ class Pipeline(pipeline.Pipeline):
                 `enable_metadata_routing=True` is set via
                 :func:`~sklearn.set_config`.
 
+            With ``weight_resampling='conserve'``, a ``sample_weight``
+            argument is reserved for the weight-conserving resampling: it is
+            validated, carried through the samplers and the resulting weights
+            are handed to the final estimator. It must be one-dimensional, of
+            the same length as ``X``, finite, non-negative and with a
+            strictly positive total mass, otherwise a ``ValueError`` is
+            raised before any fitting happens. If no ``sample_weight`` is
+            given, uniform weights are used. Other metadata keep their usual
+            routing rules.
+
             See :ref:`Metadata Routing User Guide <metadata_routing>` for more
             details.
 
@@ -514,8 +657,38 @@ class Pipeline(pipeline.Pipeline):
                 "later."
             )
 
+        conserve = self.weight_resampling == "conserve"
+        sample_weight = None
+        if conserve:
+            sample_weight = params.pop("sample_weight", None)
+            if sample_weight is None:
+                sample_weight = np.ones(_num_samples(X), dtype=np.float64)
+            else:
+                sample_weight = validate_sample_weight(sample_weight, _num_samples(X))
+            # fail fast, before any fitting happens
+            self._validate_weight_conserve_setup()
+            # the books of a previous fit are rebuilt from scratch
+            self.__dict__.pop("resampling_audit_", None)
+
         routed_params = self._check_method_params(method="fit", props=params)
-        Xt, yt = self._fit(X, y, routed_params, raw_params=params)
+        if conserve:
+            final_step_name = self.steps[-1][0]
+            if "sample_weight" in routed_params[final_step_name]["fit"]:
+                raise ValueError(
+                    "sample_weight is managed by the weight-conserving "
+                    "resampling when weight_resampling='conserve'. Do not "
+                    "pass it to the final estimator with "
+                    f"`{final_step_name}__sample_weight` or request it with "
+                    "`set_fit_request`; the conserved weights are handed to "
+                    "the final estimator automatically."
+                )
+        Xt, yt = self._fit(
+            X,
+            y,
+            routed_params,
+            raw_params=params,
+            sample_weight=sample_weight if conserve else None,
+        )
         with _print_elapsed_time("Pipeline", self._log_message(len(self.steps) - 1)):
             if self._final_estimator != "passthrough":
                 last_step_params = self._get_metadata_for_step(
@@ -523,7 +696,18 @@ class Pipeline(pipeline.Pipeline):
                     step_params=routed_params[self.steps[-1][0]],
                     all_params=params,
                 )
-                self._final_estimator.fit(Xt, yt, **last_step_params["fit"])
+                fit_params = dict(last_step_params["fit"])
+                if conserve:
+                    fit_params["sample_weight"] = self._fit_weight_accounting[0]
+                self._final_estimator.fit(Xt, yt, **fit_params)
+        if conserve:
+            weight_out, flow_total, dropped_total = self._fit_weight_accounting
+            self.resampling_audit_ = ResamplingAudit(
+                sample_weight_in=sample_weight,
+                sample_weight_out=weight_out,
+                contributions=flow_total,
+                dropped_weight=dropped_total,
+            )
         return self
 
     def _can_fit_transform(self):
@@ -1338,6 +1522,27 @@ def _fit_resample_one(sampler, X, y, message_clsname="", message=None, params=No
         return X_res, y_res, sampler
 
 
+def _fit_resample_weighted_one(
+    sampler, X, y, sample_weight, message_clsname="", message=None, params=None
+):
+    """Fit a sampler with weight conservation and return its bookkeeping.
+
+    The ``sample_weight`` argument is part of the cached call so that the
+    same data with different weights never hits a stale entry.
+    """
+    with _print_elapsed_time(message_clsname, message):
+        result = sampler.fit_resample_weighted(X, y, sample_weight)
+
+        return (
+            result.X,
+            result.y,
+            result.sample_weight,
+            result.contributions,
+            result.dropped_weight,
+            sampler,
+        )
+
+
 def _transform_one(transformer, X, y, weight, params=None):
     """Call transform and apply weight to output.
 
@@ -1396,10 +1601,13 @@ def _fit_transform_one(
         "memory": [None, str, HasMethods(["cache"])],
         "transform_input": [None, list],
         "verbose": ["boolean"],
+        "weight_resampling": [None, StrOptions({"conserve"})],
     },
     prefer_skip_nested_validation=True,
 )
-def make_pipeline(*steps, memory=None, transform_input=None, verbose=False):
+def make_pipeline(
+    *steps, memory=None, transform_input=None, verbose=False, weight_resampling=None
+):
     """Construct a Pipeline from the given estimators.
 
     This is a shorthand for the Pipeline constructor; it does not require, and
@@ -1436,6 +1644,13 @@ def make_pipeline(*steps, memory=None, transform_input=None, verbose=False):
         If True, the time elapsed while fitting each step will be printed as it
         is completed.
 
+    weight_resampling : {'conserve'}, default=None
+        Enable weight-conserving resampling when calling
+        :meth:`~imblearn.pipeline.Pipeline.fit` with a ``sample_weight``
+        argument. See :class:`~imblearn.pipeline.Pipeline` for details.
+
+        .. versionadded:: 0.14
+
     Returns
     -------
     p : Pipeline
@@ -1459,4 +1674,5 @@ def make_pipeline(*steps, memory=None, transform_input=None, verbose=False):
         memory=memory,
         transform_input=transform_input,
         verbose=verbose,
+        weight_resampling=weight_resampling,
     )

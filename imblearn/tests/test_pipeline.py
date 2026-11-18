@@ -554,6 +554,7 @@ def test_set_pipeline_step_passthrough(passthrough):
         "last__mult": 5,
         "verbose": False,
         "transform_input": None,
+        "weight_resampling": None,
     }
     assert pipeline.get_params(deep=True) == expected_params
 

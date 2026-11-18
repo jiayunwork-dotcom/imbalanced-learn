@@ -11,10 +11,12 @@ from sklearn.base import BaseEstimator, OneToOneFeatureMixin
 from sklearn.preprocessing import label_binarize
 from sklearn.utils._metadata_requests import METHODS
 from sklearn.utils.multiclass import check_classification_targets
+from sklearn.utils.validation import _num_samples
 
 from .utils import check_sampling_strategy, check_target_type
 from .utils._sklearn_compat import _fit_context, get_tags, validate_data
 from .utils._validation import ArraysTransformer
+from .utils._weight_accounting import WeightedResamplingResult, validate_sample_weight
 
 if "fit_predict" not in METHODS:
     METHODS.append("fit_predict")
@@ -225,6 +227,109 @@ class BaseSampler(SamplerMixin, OneToOneFeatureMixin, BaseEstimator):
 
 def _identity(X, y):
     return X, y
+
+
+def _supports_weighted_resampling(estimator):
+    """Return True if `estimator` supports weight-conserving resampling.
+
+    The capability is declared per concrete class with the class attribute
+    ``_weighted_resampling_supported = True`` and is deliberately *not*
+    inherited: subclasses implementing a different resampling logic (e.g.
+    :class:`~imblearn.over_sampling.SMOTENC`) would record an invalid
+    provenance if they reused the bookkeeping of their parent class.
+    """
+    return bool(type(estimator).__dict__.get("_weighted_resampling_supported", False))
+
+
+def _fit_resample_weighted(sampler, X, y, sample_weight):
+    """Shared scaffolding of the ``fit_resample_weighted`` methods.
+
+    This mirrors :meth:`SamplerMixin.fit_resample` and additionally builds
+    the weight-conservation bookkeeping. The actual sampling is delegated to
+    ``sampler._fit_resample_flow`` which must produce the exact same ``X``
+    and ``y`` as ``sampler._fit_resample``.
+    """
+    if not _supports_weighted_resampling(sampler):
+        raise NotImplementedError(
+            f"{type(sampler).__name__} does not support weight-conserving "
+            "resampling. Only RandomOverSampler (with shrinkage=None), SMOTE, "
+            "EditedNearestNeighbours and SMOTEENN implement "
+            "fit_resample_weighted."
+        )
+    sample_weight = validate_sample_weight(sample_weight, _num_samples(X))
+    check_classification_targets(y)
+    arrays_transformer = ArraysTransformer(X, y)
+    X, y, binarize_y = sampler._check_X_y(X, y)
+
+    sampler.sampling_strategy_ = check_sampling_strategy(
+        sampler.sampling_strategy, y, sampler._sampling_type
+    )
+
+    X_res, y_res, contributions, dropped_weight = sampler._fit_resample_flow(
+        X, y, sample_weight
+    )
+
+    y_ = label_binarize(y_res, classes=np.unique(y)) if binarize_y else y_res
+
+    X_, y_ = arrays_transformer.transform(X_res, y_)
+    return WeightedResamplingResult(
+        X=X_,
+        y=y_,
+        sample_weight=contributions.output_sums(),
+        contributions=contributions,
+        dropped_weight=dropped_weight,
+    )
+
+
+_FIT_RESAMPLE_WEIGHTED_DOCSTRING = """Resample the dataset and track each weight.
+
+    This is the weight-conserving counterpart of ``fit_resample``: the
+    resampled data are identical to what ``fit_resample`` returns with the
+    same parameters and random state, and each output row is additionally
+    given a training weight funded by the original observations it derives
+    from. The total mass is conserved: the weight of an original observation
+    is split over the output rows it funds and, for rows removed by a
+    cleaning step, recorded as dropped mass.
+
+    Read more in the :ref:`User Guide <weight_conservation>`.
+
+    Parameters
+    ----------
+    X : {array-like, dataframe, sparse matrix} of shape \\
+            (n_samples, n_features)
+        Matrix containing the data which have to be sampled.
+
+    y : array-like of shape (n_samples,)
+        Corresponding label for each sample in X.
+
+    sample_weight : array-like of shape (n_samples,)
+        The weight of each original observation. It must be one-dimensional,
+        of the same length as ``X``, finite, non-negative and with a strictly
+        positive total mass, otherwise a ``ValueError`` is raised and no
+        resampling is performed. The array is copied and never modified.
+
+    Returns
+    -------
+    result : WeightedResamplingResult
+        The resampled ``X``, ``y`` and their ``sample_weight`` aligned with
+        the output rows, the non-zero ``contributions`` records
+        ``(input position, output position, mass)`` and the
+        ``dropped_weight`` of each input row.
+
+    Notes
+    -----
+    Each original observation splits its weight equally over the output rows
+    it funds: its own kept row, the rows copied from it, and the synthetic
+    samples for which it was one of the two generating endpoints. A synthetic
+    sample is funded by its two endpoints only, a copied row by its source
+    row only, and a kept original row by itself only.
+    """
+
+
+def _document_fit_resample_weighted(func):
+    """Attach the shared ``fit_resample_weighted`` docstring."""
+    func.__doc__ = _FIT_RESAMPLE_WEIGHTED_DOCSTRING
+    return func
 
 
 def is_sampler(estimator):

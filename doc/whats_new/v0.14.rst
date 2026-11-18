@@ -18,6 +18,17 @@ Enhancements
   that samples are distributed in folds based on their instance hardness.
   :pr:`1125` by :user:`Frits Hermans <fritshermans>`.
 
+- Add weight-conserving resampling: :class:`~imblearn.over_sampling.RandomOverSampler`
+  (with ``shrinkage=None``), :class:`~imblearn.over_sampling.SMOTE`,
+  :class:`~imblearn.under_sampling.EditedNearestNeighbours` and
+  :class:`~imblearn.combine.SMOTEENN` provide a ``fit_resample_weighted`` method
+  returning the resampled data together with the training weight of each output
+  row, the ``(input, output, mass)`` contributions and the dropped mass of each
+  input row. :class:`~imblearn.pipeline.Pipeline` supports
+  ``weight_resampling='conserve'`` to carry the weights through the samplers to
+  the final estimator and exposes the reconciliation in ``resampling_audit_``.
+  See :ref:`weight_conservation`.
+
 Compatibility
 .............
 

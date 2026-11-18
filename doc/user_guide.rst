@@ -17,6 +17,7 @@ User Guide
    under_sampling.rst
    combine.rst
    ensemble.rst
+   weight_conservation.rst
    miscellaneous.rst
    metrics.rst
    model_selection.rst
