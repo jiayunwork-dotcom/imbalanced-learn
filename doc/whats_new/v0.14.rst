@@ -11,6 +11,32 @@ Changelog
 Bug fixes
 .........
 
+- :class:`~imblearn.over_sampling.KMeansSMOTE` now generates exactly the
+  number of additional rows parsed from ``sampling_strategy_``. Previously the
+  quota was rounded up cluster by cluster, which could generate more rows than
+  requested, and a ``NaN`` was produced when every eligible cluster had a zero
+  sparsity (all class points of a cluster coinciding). Both endpoints of a new
+  row now come from the same eligible cluster and the same class. A cluster
+  with a zero sparsity receives no row; when all eligible clusters have zero
+  sparsity, the quota is spread uniformly over them.
+
+- :class:`~imblearn.over_sampling.ADASYN` now generates exactly the number of
+  additional rows parsed from ``sampling_strategy_``. Previously the per-anchor
+  counts were rounded independently, which could generate fewer rows than
+  requested, and a ``ValueError`` was raised when every anchor rounded down.
+  Anchors whose neighbours are all of the same class receive no row. The
+  interpolation neighbours are searched among the class samples only; rows are
+  identified by position, so a row with identical features is still a valid
+  neighbour. The "not suited for this dataset" error is still raised when no
+  anchor has a neighbour of another class.
+
+- The integer allocation of a class quota over weighted sources is shared by
+  :class:`~imblearn.over_sampling.ADASYN` and
+  :class:`~imblearn.over_sampling.KMeansSMOTE` and follows the largest
+  remainder rule: each source receives its ideal share to within one row, ties
+  are broken by a seeded permutation, and the per-source plan sums exactly to
+  the requested total. See :ref:`over_sampling_exact_quotas`.
+
 Enhancements
 ............
 

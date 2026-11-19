@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from sklearn.utils._param_validation import Interval, StrOptions
 
 from ..base import BaseSampler
+from ._planning import allocate_integer_quotas
 
 
 class BaseOverSampler(BaseSampler):
@@ -70,3 +71,35 @@ class BaseOverSampler(BaseSampler):
         ],
         "random_state": ["random_state"],
     }
+
+    def _allocate_source_quotas(self, source_weights, n_samples):
+        """Split the rows to generate over the sampler's sources.
+
+        Parameters
+        ----------
+        source_weights : array-like of shape (n_sources,)
+            Relative, ordered, non-negative weights of the sources that this
+            sampler is allowed to draw from.  The sampler is responsible for
+            deciding which sources are available and how each weight is
+            computed.
+
+        n_samples : int
+            Exact number of new rows to generate for the class being sampled,
+            as parsed from ``sampling_strategy_``.
+
+        Returns
+        -------
+        quotas : ndarray of shape (n_sources,), dtype=int64
+            Integer number of rows to generate from each source.  The counts
+            sum exactly to ``n_samples`` and differ from the ideal share
+            ``n_samples * weight / sum(weights)`` by less than one row.
+
+        Notes
+        -----
+        All weighted over-samplers share this planning step so that, given
+        the same ordered weights, the same requested total and the same
+        integer seed, they produce the same per-source quotas.
+        """
+        return allocate_integer_quotas(
+            source_weights, n_samples, random_state=self.random_state
+        )

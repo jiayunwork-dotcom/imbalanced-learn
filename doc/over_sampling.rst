@@ -111,7 +111,7 @@ the same manner::
   >>> clf_smote = LogisticRegression().fit(X_resampled, y_resampled)
   >>> X_resampled, y_resampled = ADASYN().fit_resample(X, y)
   >>> print(sorted(Counter(y_resampled).items()))
-  [(0, 4673), (1, 4662), (2, 4674)]
+  [(0, 4674), (1, 4674), (2, 4674)]
   >>> clf_adasyn = LogisticRegression().fit(X_resampled, y_resampled)
 
 The figure below illustrates the major difference of the different
@@ -321,6 +321,55 @@ which are not from the same class than :math:`x_i` in a given
 neighborhood. Therefore, more samples will be generated in the area that the
 nearest neighbor rule is not respected. The parameter ``m_neighbors`` is
 equivalent to ``k_neighbors`` in :class:`SMOTE`.
+
+.. _over_sampling_exact_quotas:
+
+Exact per-source quotas in ADASYN and KMeansSMOTE
+-------------------------------------------------
+
+:class:`ADASYN` and :class:`KMeansSMOTE` do not generate rows from the class as
+a whole but from several *sources*: the anchors of :class:`ADASYN` and the
+eligible clusters of :class:`KMeansSMOTE`. Each sampler decides on its own
+which sources are available and how much relative weight each carries
+(anchor difficulty and cluster sparsity respectively), but the way those
+weights are turned into an exact integer number of rows is shared. Given the
+same ordered weights, the same number of rows to generate and the same integer
+``random_state``, both samplers produce the same per-source quotas.
+
+The number of rows to generate for a class is exactly the number of additional
+rows parsed from ``sampling_strategy_``: requesting 9 samples for a class that
+already holds 6 rows returns the 6 original rows plus exactly 3 new rows.
+Original rows are kept first and in their order, classes that are not targeted
+are left untouched, and a class whose quota is zero skips the generation
+entirely.
+
+The allocation rule is the *largest remainder* method. With ``n`` rows to
+generate over sources of weights :math:`w_i`, the ideal share of source ``i``
+is :math:`n w_i / \sum_j w_j`; every source receives either the floor or the
+ceiling of that ideal share, so its actual count differs from it by less than
+one row. The rows left after taking the floors go to the sources with the
+largest fractional parts. Sources with a zero weight never receive anything,
+even when there are fewer rows than sources; when the quota is small, some
+sources with a positive share therefore receive no row at all.
+
+Fractional parts are often tied, in particular when all weights are equal.
+Ties are broken by a permutation drawn from ``random_state`` instead of by
+position, so a source is not systematically favoured because it happens to
+come first; an integer ``random_state`` makes the plan reproducible. The
+algorithm only needs ``O(number of sources)`` additional memory.
+
+For :class:`KMeansSMOTE`, both endpoints of a new row belong to the same
+eligible cluster and to the class being over-sampled, and a cluster whose
+class points all coincide has a zero sparsity and receives no row. If all
+eligible clusters are degenerate, the quota is spread uniformly over them so
+that the plan remains defined; interpolating between coincident points then
+produces their common value. For :class:`ADASYN`, the difficulty of an anchor
+is measured over the whole data set before any generation, and the
+interpolation neighbours are searched among the class samples only.
+
+The per-source plan is available after fitting as ``_source_quotas_``, a
+dictionary keyed by class. A runnable illustration of these rules is provided
+by ``examples/over-sampling/demo_exact_quotas.py``.
 
 Multi-class management
 ----------------------

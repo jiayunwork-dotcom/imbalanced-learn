@@ -18,6 +18,7 @@ from sklearn.utils._param_validation import HasMethods, Interval, StrOptions
 
 from ...utils import Substitution
 from ...utils._docstring import _n_jobs_docstring, _random_state_docstring
+from .._planning import neighbors_excluding_self
 from ..base import BaseOverSampler
 from .base import BaseSMOTE
 
@@ -88,6 +89,13 @@ class KMeansSMOTE(BaseSMOTE):
     cluster_balance_threshold_ : float
         The threshold used during ``fit`` for calling a cluster balanced.
 
+    _source_quotas_ : dict
+        For each class actually over-sampled, the integer number of rows
+        allocated to each eligible cluster, in cluster order. The counts sum
+        exactly to the number of additional rows parsed from
+        ``sampling_strategy_``. Exposed for inspection; not part of the
+        stability guarantees.
+
     n_features_in_ : int
         Number of features in the input dataset.
 
@@ -113,6 +121,24 @@ class KMeansSMOTE(BaseSMOTE):
     BorderlineSMOTE : Over-sample using Borderline-SMOTE variant.
 
     ADASYN : Over-sample using ADASYN.
+
+    Notes
+    -----
+    Only clusters that satisfy ``cluster_balance_threshold`` and contain
+    enough samples of the class to fit ``k_neighbors`` are eligible. The
+    number of rows to generate for a class is the number of additional rows
+    requested through ``sampling_strategy_``; it is split over the eligible
+    clusters by the shared largest-remainder rule (see
+    :mod:`imblearn.over_sampling._planning`), so the total is exact and no
+    generated row is discarded afterwards. Each cluster's weight is its
+    sparsity, as in the original algorithm: sparse clusters receive more new
+    rows and a cluster whose class points all coincide has a zero sparsity
+    and receives nothing. If every eligible cluster has a zero sparsity, the
+    quota is spread uniformly over the eligible clusters instead, which keeps
+    the plan well defined and reproducible; interpolating between coincident
+    points then reproduces their common value. Both endpoints of a new row
+    always come from the same eligible cluster and belong to the class being
+    over-sampled.
 
     References
     ----------
@@ -215,11 +241,40 @@ class KMeansSMOTE(BaseSMOTE):
         )
         return (mean_distance**exponent) / X.shape[0]
 
+    def _cluster_weights(self, cluster_sparsities):
+        """Turn the sparsities of the eligible clusters into relative weights.
+
+        The weights follow the algorithm of [1]_: a cluster is weighted by its
+        sparsity, so that sparse (i.e. less dense) regions receive more new
+        samples, and a cluster whose class points all coincide has a sparsity
+        of zero and receives no sample.
+
+        When *every* eligible cluster has a zero sparsity there is no density
+        information left to distinguish them.  Rather than dividing by zero
+        (which used to yield ``NaN`` weights and eventually crash), the
+        remaining quota is then spread **uniformly over the eligible
+        clusters**: they all passed the same balance and neighbour-count
+        requirements, so none of them deserves to be singled out, and the
+        plan stays deterministic.  Interpolation between coincident points
+        simply reproduces their common value, which is the expected SMOTE
+        behaviour for degenerate clusters.
+        """
+        sparsities = np.asarray(cluster_sparsities, dtype=np.float64)
+        weights = np.where(sparsities > 0, sparsities, 0.0)
+        if not weights.sum() > 0:
+            # all eligible clusters are degenerate: documented uniform rule
+            weights = np.ones_like(weights)
+        return weights
+
     def _fit_resample(self, X, y):
         self._validate_estimator()
         X_resampled = X.copy()
         y_resampled = y.copy()
         total_inp_samples = sum(self.sampling_strategy_.values())
+        # Per-class integer plan over the eligible clusters, in cluster order.
+        # Recorded so that callers and tests can check that generation
+        # honours the shared allocation rule.
+        self._source_quotas_ = {}
 
         for class_sample, n_samples in self.sampling_strategy_.items():
             if n_samples == 0:
@@ -263,9 +318,6 @@ class KMeansSMOTE(BaseSMOTE):
                 valid_clusters.append(cluster_mask)
                 cluster_sparsities.append(self._find_cluster_sparsity(X_cluster_class))
 
-            cluster_sparsities = np.array(cluster_sparsities)
-            cluster_weights = cluster_sparsities / cluster_sparsities.sum()
-
             if not valid_clusters:
                 raise RuntimeError(
                     "No clusters found with sufficient samples of "
@@ -274,7 +326,21 @@ class KMeansSMOTE(BaseSMOTE):
                     "clusters."
                 )
 
+            # The exact number of rows each eligible cluster must generate.
+            # ``n_samples`` is the number of *additional* rows requested by
+            # ``sampling_strategy_``; the plan sums to it exactly, so no row
+            # is generated twice nor dropped afterwards.
+            cluster_quotas = self._allocate_source_quotas(
+                self._cluster_weights(cluster_sparsities), n_samples
+            )
+            self._source_quotas_[class_sample] = cluster_quotas
+
             for valid_cluster_idx, valid_cluster in enumerate(valid_clusters):
+                cluster_n_samples = int(cluster_quotas[valid_cluster_idx])
+                if cluster_n_samples == 0:
+                    # no quota for this cluster: skip the construction
+                    continue
+
                 X_cluster = _safe_indexing(X, valid_cluster)
                 y_cluster = _safe_indexing(y, valid_cluster)
 
@@ -283,12 +349,13 @@ class KMeansSMOTE(BaseSMOTE):
                 )
 
                 self.nn_k_.fit(X_cluster_class)
-                nns = self.nn_k_.kneighbors(X_cluster_class, return_distance=False)[
-                    :, 1:
-                ]
-
-                cluster_n_samples = int(
-                    math.ceil(n_samples * cluster_weights[valid_cluster_idx])
+                nns = self.nn_k_.kneighbors(X_cluster_class, return_distance=False)
+                # Drop each point's own row by *position*: identical feature
+                # rows are still legitimate neighbours, whereas the query row
+                # itself may appear anywhere (or not at all) when ties are
+                # resolved by the nearest-neighbour implementation.
+                nns = neighbors_excluding_self(
+                    nns, np.arange(X_cluster_class.shape[0]), nns.shape[1] - 1
                 )
 
                 X_new, y_new = self._make_samples(
